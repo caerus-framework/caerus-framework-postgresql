@@ -7,7 +7,7 @@
 
 Caerus Framework PostgreSQL Component. Wraps a [pgx](https://github.com/jackc/pgx)
 connection pool (`pgxpool`), verifies connectivity at `Init` (fail-fast), and
-closes it at `Shutdown`. Requires the `data` stage to be registered.
+closes it at `Shutdown`. Registers in the `data` initialization stage.
 
 ## Not an ORM — the ops chassis for Postgres
 
