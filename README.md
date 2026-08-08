@@ -32,7 +32,7 @@ For every new service using this component:
       for `//go:embed` FS) as a K8s Job **before** the Deployment; serving pods omit `WithMigrateOnInit`
 - [ ] `WithConfigSource("…")` for file-based config (External Secrets rotation)
 - [ ] `WithName` + `GetByName` when a process needs primary + replica
-- [ ] Confirm `caerus_postgresql_pool_*` on `/metrics` (pool saturation visible)
+- [ ] Confirm `postgresql_pool_*` on `/metrics` (pool saturation visible)
 
 ## Wiring
 
@@ -425,20 +425,20 @@ the `observability` component's `/readyz` endpoint reflects real database
 connectivity. Before `Init` or after `Shutdown` (nil pool) it reports unhealthy.
 
 It also implements `cf.MetricsProvider`: while connected it contributes
-`caerus_postgresql_info` plus pool gauges and counters to `/metrics` (all
+`postgresql_info` plus pool gauges and counters to `/metrics` (all
 labeled `database`, `user`, `host`, `port`, `component` = `Name()`):
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `caerus_postgresql_pool_idle` | gauge | idle connections |
-| `caerus_postgresql_pool_total` | gauge | total connections |
-| `caerus_postgresql_pool_max` | gauge | pool maximum |
-| `caerus_postgresql_pool_acquired` | gauge | currently acquired |
-| `caerus_postgresql_pool_acquire_total` | counter | cumulative successful acquires |
-| `caerus_postgresql_pool_empty_acquire_total` | counter | acquires that had to wait |
-| `caerus_postgresql_pool_canceled_acquire_total` | counter | acquires canceled by context |
+| `postgresql_pool_idle` | gauge | idle connections |
+| `postgresql_pool_total` | gauge | total connections |
+| `postgresql_pool_max` | gauge | pool maximum |
+| `postgresql_pool_acquired` | gauge | currently acquired |
+| `postgresql_pool_acquire_total` | counter | cumulative successful acquires |
+| `postgresql_pool_empty_acquire_total` | counter | acquires that had to wait |
+| `postgresql_pool_canceled_acquire_total` | counter | acquires canceled by context |
 
-Scrape `caerus_postgresql_pool_acquired / max` for **pool saturation** — the
+Scrape `postgresql_pool_acquired / max` for **pool saturation** — the
 day-2 signal this module is for. Before `Init` or after `Shutdown` it reports
 nothing (lazy pickup).
 
