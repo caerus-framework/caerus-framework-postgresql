@@ -10,8 +10,8 @@ github.com/caerus-framework/caerus-framework-configuration v0.0.3 h1:HEA8Jaurd69
 github.com/caerus-framework/caerus-framework-configuration v0.0.3/go.mod h1:BS8QxSbAvGPz1i9/9OGIPpEXf4RSk64XeMog25YVJUg=
 github.com/caerus-framework/caerus-framework-logs v0.0.3 h1:oR/fvH2RxmNTvdd+4njXyaqUHd422otB43Vrx+M7f5Q=
 github.com/caerus-framework/caerus-framework-logs v0.0.3/go.mod h1:/KaIo0m65NU5Q+aNj/h5PrVRbsp6COa8EG4/0KNKxM0=
-github.com/caerus-framework/caerus-framework-observability v0.0.1 h1:PZvxorx7YjcncgzEJnKQH7/N2BuPCVTGpiKhoVZ3cXI=
-github.com/caerus-framework/caerus-framework-observability v0.0.1/go.mod h1:3/L3NqwC3mF1pBPLghAMhZmRmAKHaiFdfhhF8VBvTv4=
+github.com/caerus-framework/caerus-framework-observability v0.0.2 h1:Lx5ouvcIMzrSyA9DUa/3EMan7MCkYtv4IMx6nThT1MU=
+github.com/caerus-framework/caerus-framework-observability v0.0.2/go.mod h1:3/L3NqwC3mF1pBPLghAMhZmRmAKHaiFdfhhF8VBvTv4=
 github.com/cenkalti/backoff/v5 v5.0.3 h1:ZN+IMa753KfX5hd8vVaMixjnqRZ3y8CuJKRKj1xcsSM=
 github.com/cenkalti/backoff/v5 v5.0.3/go.mod h1:rkhZdG3JZukswDf7f0cwqPNk4K0sa+F97BxZthm/crw=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
