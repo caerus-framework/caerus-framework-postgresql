@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	cf "github.com/caerus-framework/caerus-framework"
@@ -79,27 +80,38 @@ type PostgresConfig struct {
 	TLSRootCAFile     string `json:"tls_root_ca_file,omitempty" yaml:"tls_root_ca_file,omitempty" env:"TLS_ROOT_CA_FILE"`
 	TLSClientCertFile string `json:"tls_client_cert_file,omitempty" yaml:"tls_client_cert_file,omitempty" env:"TLS_CLIENT_CERT_FILE"`
 	TLSClientKeyFile  string `json:"tls_client_key_file,omitempty" yaml:"tls_client_key_file,omitempty" env:"TLS_CLIENT_KEY_FILE"`
+	// DegradedMode — when true, a failed Init ping (or pool create) does not
+	// abort the process. The pool is kept when create succeeded so later
+	// reconnect can work; metrics/logs scream. Default off (pointer so
+	// omitted ≠ explicit false). Off by default (hard Init).
+	DegradedMode *bool `json:"degraded_mode,omitempty" yaml:"degraded_mode,omitempty" env:"DEGRADED_MODE"`
+	// HealthWhenDegraded: "not_ready" (default) or "ready". Controls Health()
+	// (and thus /readyz) while the pool cannot ping after a degraded Init
+	// or while disconnected. "ready" is break-glass: send LB traffic anyway.
+	HealthWhenDegraded string `json:"health_when_degraded,omitempty" yaml:"health_when_degraded,omitempty" env:"HEALTH_WHEN_DEGRADED"`
 }
 
 // Option configures the postgresql component at construction time.
 type Option func(*options)
 
 type options struct {
-	poolConfig    *pgxpool.Config
-	loaded        *PostgresConfig // set by WithConfig; overrides option-set defaults
-	configSource  string          // named configuration source for live reload
-	configPath    string          // source file path (module self-registration)
-	srcEnvPrefix  string          // source env overlay prefix (default: NAME_)
-	srcFormat     cf_configuration.Format
-	srcFormatSet  bool
-	migrations    *migrationConfig
-	migrateOnInit bool
-	logger        *slog.Logger
-	loggerSet     bool // true when WithLogger was called explicitly
-	pingTimeout   time.Duration
-	name          string // custom component name; empty means use ComponentName
-	optErr        error  // deferred construction errors; returned from Init
-	tlsFiles      tlsFiles
+	poolConfig         *pgxpool.Config
+	loaded             *PostgresConfig // set by WithConfig; overrides option-set defaults
+	configSource       string          // named configuration source for live reload
+	configPath         string          // source file path (module self-registration)
+	srcEnvPrefix       string          // source env overlay prefix (default: NAME_)
+	srcFormat          cf_configuration.Format
+	srcFormatSet       bool
+	migrations         *migrationConfig
+	migrateOnInit      bool
+	logger             *slog.Logger
+	loggerSet          bool // true when WithLogger was called explicitly
+	pingTimeout        time.Duration
+	name               string // custom component name; empty means use ComponentName
+	optErr             error  // deferred construction errors; returned from Init
+	tlsFiles           tlsFiles
+	degradedMode       bool
+	healthWhenDegraded string // "ready" | "not_ready"
 }
 
 // tlsFiles holds PEM file paths for TLS/mTLS. Files are re-read whenever a
@@ -437,28 +449,49 @@ func WithName(name string) Option {
 	return func(o *options) { o.name = name }
 }
 
+// WithDegradedMode allows Init to succeed when the connectivity ping (or pool
+// create) fails. Default is hard-fail. Degraded mode screams in logs/metrics;
+// Health still fails ping unless HealthWhenDegraded is "ready".
+func WithDegradedMode(enabled bool) Option {
+	return func(o *options) { o.degradedMode = enabled }
+}
+
+// WithHealthWhenDegraded sets Health() behaviour while unreachable after
+// DegradedMode: "not_ready" (default) or "ready" (break-glass LB traffic).
+func WithHealthWhenDegraded(policy string) Option {
+	return func(o *options) { o.healthWhenDegraded = policy }
+}
+
 // CFPostgres is the caerus-framework-postgresql component. It wraps a pgx
 // connection pool, verifies connectivity at Init, and closes it at Shutdown.
 type CFPostgres struct {
-	mu            sync.RWMutex
-	baseConfig    *pgxpool.Config // option defaults (before config source)
-	poolConfig    *pgxpool.Config
-	configSource  string
-	configPath    string
-	srcEnvPrefix  string
-	srcFormat     cf_configuration.Format
-	srcFormatSet  bool
-	pingTimeout   time.Duration
-	migrations    *migrationConfig
-	migrateOnInit bool
-	loggerSet     bool
-	pool          *pgxpool.Pool
-	logger        *slog.Logger
-	logsSub       *cf_logs.Subscription
-	fw            *cf.CaerusFramework
-	name          string // custom name; empty means use ComponentName
-	optErr        error  // deferred from New options / WithConfig; returned by Init
-	tlsFiles      tlsFiles
+	mu                 sync.RWMutex
+	baseConfig         *pgxpool.Config // option defaults (before config source)
+	poolConfig         *pgxpool.Config
+	configSource       string
+	configPath         string
+	srcEnvPrefix       string
+	srcFormat          cf_configuration.Format
+	srcFormatSet       bool
+	pingTimeout        time.Duration
+	migrations         *migrationConfig
+	migrateOnInit      bool
+	loggerSet          bool
+	pool               *pgxpool.Pool
+	logger             *slog.Logger
+	logsSub            *cf_logs.Subscription
+	fw                 *cf.CaerusFramework
+	name               string // custom name; empty means use ComponentName
+	optErr             error  // deferred from New options / WithConfig; returned by Init
+	tlsFiles           tlsFiles
+	degradedMode       bool
+	healthWhenDegraded string // "ready" | "not_ready"
+	initDone           atomic.Bool
+	// liveConnected is true after a successful ping (Init or Health recovery).
+	liveConnected atomic.Bool
+	// degradedUnreachable: Init ping failed under DegradedMode (or later ping lost).
+	degradedUnreachable atomic.Bool
+	degradedModeUses    atomic.Uint64
 }
 
 // New creates a postgresql component. The pool is created and pinged at Init,
@@ -479,28 +512,52 @@ func New(opts ...Option) *CFPostgres {
 		opt(&o)
 	}
 	baseCopy := o.poolConfig.Copy()
+	degrade := o.degradedMode
+	healthDegraded := normalizeHealthWhenDegraded(o.healthWhenDegraded)
 	if o.loaded != nil {
 		if err := applyLoadedConfig(o.poolConfig, *o.loaded); err != nil && o.optErr == nil {
 			o.optErr = err
 		}
+		degrade, healthDegraded = degradedModeFromConfig(*o.loaded, degrade, healthDegraded)
 	}
 	return &CFPostgres{
-		baseConfig:    baseCopy,
-		poolConfig:    o.poolConfig,
-		configSource:  o.configSource,
-		configPath:    o.configPath,
-		srcEnvPrefix:  o.srcEnvPrefix,
-		srcFormat:     o.srcFormat,
-		srcFormatSet:  o.srcFormatSet,
-		logger:        o.logger,
-		loggerSet:     o.loggerSet,
-		pingTimeout:   o.pingTimeout,
-		migrations:    o.migrations,
-		migrateOnInit: o.migrateOnInit,
-		name:          o.name,
-		optErr:        o.optErr,
-		tlsFiles:      o.tlsFiles,
+		baseConfig:         baseCopy,
+		poolConfig:         o.poolConfig,
+		configSource:       o.configSource,
+		configPath:         o.configPath,
+		srcEnvPrefix:       o.srcEnvPrefix,
+		srcFormat:          o.srcFormat,
+		srcFormatSet:       o.srcFormatSet,
+		logger:             o.logger,
+		loggerSet:          o.loggerSet,
+		pingTimeout:        o.pingTimeout,
+		migrations:         o.migrations,
+		migrateOnInit:      o.migrateOnInit,
+		name:               o.name,
+		optErr:             o.optErr,
+		tlsFiles:           o.tlsFiles,
+		degradedMode:       degrade,
+		healthWhenDegraded: healthDegraded,
 	}
+}
+
+func normalizeHealthWhenDegraded(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "ready":
+		return "ready"
+	default:
+		return "not_ready"
+	}
+}
+
+func degradedModeFromConfig(cfg PostgresConfig, degrade bool, healthDegraded string) (bool, string) {
+	if cfg.DegradedMode != nil {
+		degrade = *cfg.DegradedMode
+	}
+	if cfg.HealthWhenDegraded != "" {
+		healthDegraded = normalizeHealthWhenDegraded(cfg.HealthWhenDegraded)
+	}
+	return degrade, healthDegraded
 }
 
 // applyLoadedConfig overlays non-zero fields of cfg onto the pool config. It
@@ -655,12 +712,14 @@ func (c *CFPostgres) GetDependencies() []string {
 }
 
 // Init implements cf.CaerusComponent. It creates the pgx connection pool and
-// verifies connectivity with a ping, so a broken database fails startup
-// (fail-fast) before any dependent component runs.
+// verifies connectivity with a ping. By default a broken database fails
+// startup (fail-fast). With DegradedMode, a failed ping keeps the pool (or a
+// failed create leaves Pool nil) and lets Initialize continue (metrics/logs
+// scream; Health stays honest unless health_when_degraded=ready).
 func (c *CFPostgres) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.pool != nil {
+	if c.initDone.Load() {
 		return nil // already initialized
 	}
 	if c.optErr != nil {
@@ -675,39 +734,75 @@ func (c *CFPostgres) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 
 	poolCfg := c.poolConfig
 	if c.configSource != "" {
-		cfg, err := c.poolConfigFromSource()
+		cfg, degrade, healthDegraded, err := c.poolConfigFromSource()
 		if err != nil {
 			return err
 		}
 		poolCfg = cfg
 		c.poolConfig = cfg
+		c.degradedMode = degrade
+		c.healthWhenDegraded = healthDegraded
 	} else if err := applyTLSFiles(poolCfg.ConnConfig, c.tlsFiles); err != nil {
 		return err
 	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
-		return fmt.Errorf("cf_postgres: create pool: %w", err)
+		if !c.degradedMode {
+			return fmt.Errorf("cf_postgres: create pool: %w", err)
+		}
+		c.initDone.Store(true)
+		c.liveConnected.Store(false)
+		c.degradedUnreachable.Store(true)
+		c.degradedModeUses.Add(1)
+		c.logger.Error("cf_postgres: DegradedMode — create pool failed; Init continues; Health/readyz follow health_when_degraded",
+			"err", err,
+			"host", poolCfg.ConnConfig.Host,
+			"port", poolCfg.ConnConfig.Port,
+			"health_when_degraded", c.healthWhenDegraded,
+		)
+		return nil
 	}
 
 	pingCtx, cancel := context.WithTimeout(ctx, c.pingTimeout)
 	defer cancel()
 	if err := pool.Ping(pingCtx); err != nil {
-		pool.Close()
-		return fmt.Errorf("cf_postgres: ping %s:%d failed: %w",
-			poolCfg.ConnConfig.Host, poolCfg.ConnConfig.Port, err)
+		if !c.degradedMode {
+			pool.Close()
+			return fmt.Errorf("cf_postgres: ping %s:%d failed: %w",
+				poolCfg.ConnConfig.Host, poolCfg.ConnConfig.Port, err)
+		}
+		c.pool = pool
+		c.initDone.Store(true)
+		c.liveConnected.Store(false)
+		c.degradedUnreachable.Store(true)
+		c.degradedModeUses.Add(1)
+		c.logger.Error("cf_postgres: DegradedMode — ping failed; Init continues; Health/readyz follow health_when_degraded",
+			"err", err,
+			"host", poolCfg.ConnConfig.Host,
+			"port", poolCfg.ConnConfig.Port,
+			"health_when_degraded", c.healthWhenDegraded,
+		)
+		return nil
 	}
 
 	c.pool = pool
+	c.initDone.Store(true)
+	c.liveConnected.Store(true)
+	c.degradedUnreachable.Store(false)
 	if c.migrateOnInit {
 		if c.migrations == nil {
 			pool.Close()
 			c.pool = nil
+			c.initDone.Store(false)
+			c.liveConnected.Store(false)
 			return errors.New("cf_postgres: WithMigrateOnInit requires WithMigrations")
 		}
 		if err := c.applyMigrations(c.pool, c.migrations); err != nil {
 			pool.Close()
 			c.pool = nil
+			c.initDone.Store(false)
+			c.liveConnected.Store(false)
 			return fmt.Errorf("cf_postgres: migrations: %w", err)
 		}
 	}
@@ -729,14 +824,16 @@ func (c *CFPostgres) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 func (c *CFPostgres) OnConfigReload(source string, cfg any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if source != c.configSource || c.pool == nil || c.fw == nil {
+	if source != c.configSource || !c.initDone.Load() || c.fw == nil {
 		return
 	}
-	poolCfg, err := c.poolConfigFromSource()
+	poolCfg, degrade, healthDegraded, err := c.poolConfigFromSource()
 	if err != nil {
 		c.logger.Error("cf_postgres: config reload rejected", "err", err)
 		return
 	}
+	c.degradedMode = degrade
+	c.healthWhenDegraded = healthDegraded
 	ctx, cancel := context.WithTimeout(context.Background(), c.pingTimeout)
 	defer cancel()
 	newPool, err := pgxpool.NewWithConfig(ctx, poolCfg)
@@ -752,7 +849,11 @@ func (c *CFPostgres) OnConfigReload(source string, cfg any) {
 	old := c.pool
 	c.pool = newPool
 	c.poolConfig = poolCfg
-	old.Close()
+	c.liveConnected.Store(true)
+	c.degradedUnreachable.Store(false)
+	if old != nil {
+		old.Close()
+	}
 	c.logger.Info("cf_postgres: reconnected after config reload",
 		"host", poolCfg.ConnConfig.Host,
 		"port", poolCfg.ConnConfig.Port,
@@ -760,23 +861,24 @@ func (c *CFPostgres) OnConfigReload(source string, cfg any) {
 	)
 }
 
-func (c *CFPostgres) poolConfigFromSource() (*pgxpool.Config, error) {
+func (c *CFPostgres) poolConfigFromSource() (*pgxpool.Config, bool, string, error) {
 	conf, ok := cf.Get[*cf_configuration.Configuration](c.fw)
 	if !ok {
-		return nil, errors.New("cf_postgres: configuration component not registered")
+		return nil, false, "", errors.New("cf_postgres: configuration component not registered")
 	}
 	loaded, ok := cf_configuration.Get[PostgresConfig](conf, c.configSource)
 	if !ok {
-		return nil, fmt.Errorf("cf_postgres: configuration source %q not found", c.configSource)
+		return nil, false, "", fmt.Errorf("cf_postgres: configuration source %q not found", c.configSource)
 	}
 	cfg := c.baseConfig.Copy()
 	if err := applyLoadedConfig(cfg, *loaded); err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
 	if err := applyTLSFiles(cfg.ConnConfig, c.tlsFiles); err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
-	return cfg, nil
+	degrade, healthDegraded := degradedModeFromConfig(*loaded, c.degradedMode, c.healthWhenDegraded)
+	return cfg, degrade, healthDegraded, nil
 }
 
 // RegisterConfigSources implements cf.ConfigSourceRegistrar. The framework
@@ -910,6 +1012,9 @@ func (c *CFPostgres) Shutdown(ctx context.Context) error {
 		c.logsSub.Unsubscribe()
 		c.logsSub = nil
 	}
+	c.initDone.Store(false)
+	c.liveConnected.Store(false)
+	c.degradedUnreachable.Store(false)
 	if c.pool == nil {
 		return nil
 	}
@@ -950,27 +1055,54 @@ func (c *CFPostgres) WithinTx(ctx context.Context, fn func(pgx.Tx) error) error 
 
 // Health implements cf.HealthProvider. It pings the pool, so the observability
 // component's readiness endpoint reflects real database connectivity. A nil
-// pool (before Init or after Shutdown) is unhealthy.
+// pool (before Init or after Shutdown) is unhealthy. After DegradedMode with a
+// failed ping (or nil pool from a failed create), behaviour follows
+// health_when_degraded (default not_ready → still unhealthy for /readyz).
 func (c *CFPostgres) Health(ctx context.Context) error {
 	pool := c.Pool()
 	if pool == nil {
+		c.liveConnected.Store(false)
+		if c.initDone.Load() {
+			c.degradedUnreachable.Store(true)
+		}
+		if c.initDone.Load() && c.degradedMode && c.healthWhenDegraded == "ready" {
+			return nil
+		}
 		return errors.New("cf_postgres: pool is not initialized")
 	}
-	return pool.Ping(ctx)
+	if err := pool.Ping(ctx); err != nil {
+		c.liveConnected.Store(false)
+		c.degradedUnreachable.Store(true)
+		if c.degradedMode && c.healthWhenDegraded == "ready" {
+			return nil
+		}
+		return err
+	}
+	c.liveConnected.Store(true)
+	c.degradedUnreachable.Store(false)
+	return nil
 }
 
-// Metrics implements cf_observability.MetricsProvider. It reports the connected
-// pool's state; before Init or after Shutdown it returns nil, so the
-// observability component skips it (lazy pickup).
+// Metrics implements cf_observability.MetricsProvider. Before Init or after
+// Shutdown it returns nil. After Init (including DegradedMode without a live
+// ping) it always returns samples so degrade/unreachable state is visible.
 //
-// Pool gauges come from pgxpool.Stat on every scrape; *_total counters are
-// cumulative for the pool's lifetime and reset only when the pool is rebuilt
-// (config reload / reconnect). The "component" label carries Name() so named
-// primary/replica instances are distinguishable on /metrics.
+// Pool gauges come from pgxpool.Stat on every scrape when the pool is non-nil;
+// *_total counters are cumulative for the pool's lifetime and reset only when
+// the pool is rebuilt (config reload / reconnect). The "component" label
+// carries Name() so named primary/replica instances are distinguishable on
+// /metrics.
 func (c *CFPostgres) Metrics() []cf_observability.Metric {
-	pool := c.Pool()
-	if pool == nil {
+	if !c.initDone.Load() {
 		return nil
+	}
+	live := 0.0
+	if c.liveConnected.Load() {
+		live = 1
+	}
+	degraded := 0.0
+	if c.degradedUnreachable.Load() {
+		degraded = 1
 	}
 	labels := map[string]string{"component": c.Name()}
 	if cc := c.poolConfig.ConnConfig; cc != nil {
@@ -979,13 +1111,43 @@ func (c *CFPostgres) Metrics() []cf_observability.Metric {
 		labels["host"] = cc.Host
 		labels["port"] = strconv.Itoa(int(cc.Port))
 	}
-	ms := []cf_observability.Metric{{
-		Name:   "postgresql_info",
-		Help:   "PostgreSQL pool connection configuration.",
-		Value:  1,
-		Labels: labels,
-	}}
+	infoLabels := copyLabels(labels)
+	infoLabels["live"] = strconv.FormatBool(c.liveConnected.Load())
+	degradedLabels := copyLabels(labels)
+	degradedLabels["degraded_mode"] = strconv.FormatBool(c.degradedMode)
+	degradedLabels["health_when_degraded"] = c.healthWhenDegraded
+	ms := []cf_observability.Metric{
+		{
+			Name:   "postgresql_info",
+			Help:   "PostgreSQL pool descriptor; 1 while Init completed.",
+			Value:  1,
+			Labels: infoLabels,
+		},
+		{
+			Name:   "postgresql_live_connected",
+			Help:   "1 when the last successful ping succeeded.",
+			Value:  live,
+			Labels: copyLabels(labels),
+		},
+		{
+			Name:   "postgresql_degraded_unreachable",
+			Help:   "1 when running without a successful ping (DegradedMode path or lost connectivity).",
+			Value:  degraded,
+			Labels: degradedLabels,
+		},
+		{
+			Name:   "postgresql_degraded_mode_uses_total",
+			Help:   "Times Init continued after a failed ping/create because DegradedMode was enabled.",
+			Value:  float64(c.degradedModeUses.Load()),
+			Labels: copyLabels(labels),
+			Type:   cf_observability.MetricTypeCounter,
+		},
+	}
 
+	pool := c.Pool()
+	if pool == nil {
+		return ms
+	}
 	st := pool.Stat()
 	gauges := []struct {
 		name  string
@@ -998,7 +1160,7 @@ func (c *CFPostgres) Metrics() []cf_observability.Metric {
 		{"postgresql_pool_acquired", "PostgreSQL pool currently acquired connections.", float64(st.AcquiredConns())},
 	}
 	for _, g := range gauges {
-		ms = append(ms, cf_observability.Metric{Name: g.name, Help: g.help, Value: g.value, Labels: labels})
+		ms = append(ms, cf_observability.Metric{Name: g.name, Help: g.help, Value: g.value, Labels: copyLabels(labels)})
 	}
 	counters := []struct {
 		name  string
@@ -1010,9 +1172,19 @@ func (c *CFPostgres) Metrics() []cf_observability.Metric {
 		{"postgresql_pool_canceled_acquire_total", "Cumulative acquires canceled by context.", float64(st.CanceledAcquireCount())},
 	}
 	for _, ct := range counters {
-		ms = append(ms, cf_observability.Metric{Name: ct.name, Help: ct.help, Value: ct.value, Labels: labels, Type: cf_observability.MetricTypeCounter})
+		ms = append(ms, cf_observability.Metric{Name: ct.name, Help: ct.help, Value: ct.value, Labels: copyLabels(labels), Type: cf_observability.MetricTypeCounter})
 	}
 	return ms
+}
+
+// copyLabels returns a shallow copy of a label map so callers cannot mutate
+// the component's internal state.
+func copyLabels(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 var _ cf.CaerusComponent = (*CFPostgres)(nil)

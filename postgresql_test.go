@@ -302,6 +302,49 @@ func TestInitRejectsUnknownServer(t *testing.T) {
 	}
 }
 
+func TestDegradedModeAllowsFailedPing(t *testing.T) {
+	p := New(
+		WithHost("127.0.0.1"),
+		WithPort(1),
+		WithPingTimeout(200*time.Millisecond),
+		WithDegradedMode(true),
+		WithHealthWhenDegraded("not_ready"),
+	)
+	fw := newFramework(t)
+	if err := p.Init(context.Background(), fw); err != nil {
+		t.Fatalf("DegradedMode should allow Init after ping fail: %v", err)
+	}
+	if p.Pool() == nil {
+		t.Fatal("DegradedMode keeps the pool for later reconnect attempts")
+	}
+	if err := p.Health(context.Background()); err == nil {
+		t.Fatal("Health should fail when not_ready and ping fails")
+	}
+	ms := p.Metrics()
+	if ms == nil {
+		t.Fatal("Metrics should scream after DegradedMode")
+	}
+	_ = p.Shutdown(context.Background())
+}
+
+func TestDegradedModeHealthWhenReady(t *testing.T) {
+	p := New(
+		WithHost("127.0.0.1"),
+		WithPort(1),
+		WithPingTimeout(200*time.Millisecond),
+		WithDegradedMode(true),
+		WithHealthWhenDegraded("ready"),
+	)
+	fw := newFramework(t)
+	if err := p.Init(context.Background(), fw); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := p.Health(context.Background()); err != nil {
+		t.Fatalf("health_when_degraded=ready should make Health nil while down: %v", err)
+	}
+	_ = p.Shutdown(context.Background())
+}
+
 func TestWithMigrationsOptions(t *testing.T) {
 	fsys := fstest.MapFS{
 		"000001_init.up.sql":   {Data: []byte("CREATE TABLE t (id int);")},

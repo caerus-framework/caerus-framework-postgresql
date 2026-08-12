@@ -142,6 +142,8 @@ For more control (`pgx.TxOptions`, savepoints) use `pool.Begin(ctx)` and
 | `WithHealthCheckPeriod(d)` | idle health-check interval (default `1m`) |
 | `WithConnectTimeout(d)` | per-attempt connect timeout (default `0` = none, libpq default) |
 | `WithPingTimeout(d)` | Init connectivity-ping timeout (default `5s`) |
+| `WithDegradedMode(bool)` | when true, Init may succeed without a live ping/pool (default **off** / hard-fail) |
+| `WithHealthWhenDegraded("not_ready"\|"ready")` | `/readyz` while degraded: default `not_ready`; `ready` is break-glass LB traffic |
 | `WithMigrations(fsys, opts...)` | configure a migration FS (already rooted at the `.up.sql`/`.down.sql` dir) for `Migrate` / the framework job flag |
 | `WithEmbeddedMigrations(fsys, dir, opts...)` | like `WithMigrations` but takes the `//go:embed` FS + directory and resolves the sub-FS internally (mismatched dir panics at construction) |
 | `WithMigrateOnInit()` | `Init` calls `Migrate` (local/single-replica only) |
@@ -284,7 +286,7 @@ path.
 Wire postgres once with `WithMigrations`. The module declares the job flag on
 its own configuration source (`Source.Job: cf.JobSpec{Flag: "postgresql.job",
 Tasks: ["migrate"]}`), so configuration parses/validates the value like any
-other knob. The **flag names the instance** and the **value names the task**
+other setting. The **flag names the instance** and the **value names the task**
 (`--postgresql.job=migrate`, or `--postgresql.orders.job=migrate` for a
 `WithName("orders")` instance). Jobs are **CLI-only** — the task never flows
 from env or file. `RunWithSignals` asks configuration (via `cf.JobSource`) and
@@ -411,18 +413,49 @@ Helpers: `ParseDSN` / `OverlayDSN` for `postgres://` URLs and keyword DSNs.
 keeps the previous pool. In Kubernetes prefer file-mounted secrets for
 rotation; use env/DSN for local and CI.
 
-## Fail-fast behaviour
+## Fail-fast behaviour (default)
 
 `Init` creates the pool, pings the server, and applies pending migrations. If
 the connection is refused, the ping times out, or a migration fails, `Init`
 returns an error and startup aborts before any dependent component runs.
 `Pool()` returns `nil` before `Init` or after `Shutdown`.
 
+## DegradedMode (optional break-glass)
+
+**Not automatic.** Default remains hard Init. Set `degraded_mode: true` (or
+`WithDegradedMode(true)`) when the process must finish Initialize even if
+Postgres is unreachable. Migrate-on-Init and migrate Jobs still need a live
+pool — DegradedMode is for serve/break-glass shapes, not for skipping schema
+work.
+
+```json
+{
+  "host": "postgres",
+  "port": 5432,
+  "user": "app",
+  "password": "…",
+  "database": "app",
+  "degraded_mode": true,
+  "health_when_degraded": "not_ready"
+}
+```
+
+| Setting | Meaning |
+|---|---|
+| `degraded_mode` | Init may succeed without a successful ping/create; logs/metrics scream (`degraded_unreachable`, `degraded_mode_uses_total`). **Default off.** |
+| `health_when_degraded: "not_ready"` | Default — `Health` still fails → `/readyz` 503 while disconnected. |
+| `health_when_degraded: "ready"` | Break-glass — `Health` returns nil while down so LB may send traffic. Use deliberately; prefer not lying about DB-backed routes on the same pod. |
+
+DegradedMode answers “may Initialize finish?” — it does **not** mean the
+database is healthy. Hot reload of the postgresql source can rebuild the pool
+when the file updates; env alone does not wake a running process.
+
 ## Observability
 
 `CFPostgres` implements `cf.HealthProvider`: `Health(ctx)` pings the pool, so
 the `observability` component's `/readyz` endpoint reflects real database
 connectivity. Before `Init` or after `Shutdown` (nil pool) it reports unhealthy.
+After DegradedMode without a live ping, behaviour follows `health_when_degraded`.
 
 It also implements `cf.MetricsProvider`: while connected it contributes
 `postgresql_info` plus pool gauges and counters to `/metrics` (all
@@ -430,6 +463,8 @@ labeled `database`, `user`, `host`, `port`, `component` = `Name()`):
 
 | Metric | Type | Meaning |
 |---|---|---|
+| `postgresql_degraded_unreachable` | gauge | 1 when running without a successful ping (DegradedMode / lost connectivity) |
+| `postgresql_degraded_mode_uses_total` | counter | times Init continued after failed ping/create under DegradedMode |
 | `postgresql_pool_idle` | gauge | idle connections |
 | `postgresql_pool_total` | gauge | total connections |
 | `postgresql_pool_max` | gauge | pool maximum |
