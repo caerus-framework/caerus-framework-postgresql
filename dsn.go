@@ -1,6 +1,7 @@
 package cf_postgres
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -18,7 +19,8 @@ func ParseDSN(dsn string) (PostgresConfig, error) {
 	}
 	pc, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		return zero, fmt.Errorf("cf_postgres: parse DSN: %w", err)
+		// pgx interpolates the DSN (including password) into its error.
+		return zero, errors.New("cf_postgres: parse DSN: invalid connection string")
 	}
 	cfg := PostgresConfig{
 		Host:     pc.ConnConfig.Host,

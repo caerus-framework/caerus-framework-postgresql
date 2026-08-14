@@ -408,6 +408,10 @@ postgres := cf_postgres.New(
 ```
 
 Helpers: `ParseDSN` / `OverlayDSN` for `postgres://` URLs and keyword DSNs.
+`ParseDSN` errors never include the raw DSN (pgx would interpolate the
+password). `Password` is tagged `secret:"redact"`: `LogArgs` prints
+`[redacted]`, connect/reload logs use `password_set` only. Do not log the
+config struct.
 `WithConfigSource` implements `ConfigReloader`: on file reload (or
 `cfg.Reload`), builds a new pool, pings, swaps, closes the old pool; on failure
 keeps the previous pool. In Kubernetes prefer file-mounted secrets for

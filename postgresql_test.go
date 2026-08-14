@@ -272,6 +272,17 @@ func TestSSLModeInvalidInitError(t *testing.T) {
 	}
 }
 
+func TestWithConnStringInvalidDoesNotEchoPassword(t *testing.T) {
+	p := New(WithConnString("postgres://alice:LEAKSECRET@["))
+	err := p.Init(context.Background(), newFramework(t))
+	if err == nil {
+		t.Fatal("invalid connection string should fail Init")
+	}
+	if strings.Contains(err.Error(), "LEAKSECRET") {
+		t.Fatalf("password leaked in error: %v", err)
+	}
+}
+
 func TestWithConnStringInvalidInitError(t *testing.T) {
 	p := New(WithConnString("::not-a-dsn::"))
 	err := p.Init(context.Background(), newFramework(t))
