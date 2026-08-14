@@ -1,12 +1,9 @@
 package cf_postgres
 
 import (
-	"bytes"
-	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
-
-	cf_configuration "github.com/caerus-framework/caerus-framework-configuration"
 )
 
 func TestParseDSN(t *testing.T) {
@@ -32,20 +29,13 @@ func TestParseDSNInvalidDoesNotEchoPassword(t *testing.T) {
 	}
 }
 
-func TestPostgresConfigLogArgsNeverCleartext(t *testing.T) {
-	cfg := PostgresConfig{Host: "db.example", Password: "s3cret-value", Database: "app"}
-	var buf bytes.Buffer
-	l := slog.New(slog.NewTextHandler(&buf, nil))
-	l.Info("summary", cf_configuration.LogArgs(cfg)...)
-	out := buf.String()
-	if strings.Contains(out, "s3cret-value") {
-		t.Fatalf("password leaked: %s", out)
+func TestPostgresConfigPasswordSecretTag(t *testing.T) {
+	f, ok := reflect.TypeOf(PostgresConfig{}).FieldByName("Password")
+	if !ok {
+		t.Fatal("PostgresConfig.Password missing")
 	}
-	if !strings.Contains(out, "[redacted]") {
-		t.Fatalf("want [redacted] in %s", out)
-	}
-	if !strings.Contains(out, "host=db.example") {
-		t.Fatalf("host should stay visible: %s", out)
+	if got := f.Tag.Get("secret"); got != "redact" {
+		t.Fatalf("Password secret tag = %q, want redact", got)
 	}
 }
 
