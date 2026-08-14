@@ -56,7 +56,7 @@ type PostgresConfig struct {
 	Host                 string `json:"host,omitempty" yaml:"host,omitempty" env:"HOST"`
 	Port                 int    `json:"port,omitempty" yaml:"port,omitempty" env:"PORT"`
 	User                 string `json:"user,omitempty" yaml:"user,omitempty" env:"USER"`
-	Password             string `json:"password,omitempty" yaml:"password,omitempty" env:"PASSWORD"`
+	Password             string `json:"password,omitempty" yaml:"password,omitempty" env:"PASSWORD" secret:"redact"`
 	Database             string `json:"database,omitempty" yaml:"database,omitempty" env:"DATABASE"`
 	SSLMode              string `json:"ssl_mode,omitempty" yaml:"ssl_mode,omitempty" env:"SSL_MODE"`
 	MaxConns             int32  `json:"max_conns,omitempty" yaml:"max_conns,omitempty" env:"MAX_CONNS"`
@@ -272,7 +272,8 @@ func WithConnString(dsn string) Option {
 		cfg, err := pgxpool.ParseConfig(dsn)
 		if err != nil {
 			if o.optErr == nil {
-				o.optErr = fmt.Errorf("cf_postgres: parse connection string: %w", err)
+				// Do not wrap the pgx error: it interpolates the DSN (password).
+				o.optErr = errors.New("cf_postgres: parse connection string: invalid connection string")
 			}
 			return
 		}
@@ -812,6 +813,7 @@ func (c *CFPostgres) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 		"database", poolCfg.ConnConfig.Database,
 		"user", poolCfg.ConnConfig.User,
 		"max_conns", poolCfg.MaxConns,
+		cf_logs.SecretSet("password", poolCfg.ConnConfig.Password),
 	)
 	return nil
 }
@@ -858,6 +860,7 @@ func (c *CFPostgres) OnConfigReload(source string, cfg any) {
 		"host", poolCfg.ConnConfig.Host,
 		"port", poolCfg.ConnConfig.Port,
 		"database", poolCfg.ConnConfig.Database,
+		cf_logs.SecretSet("password", poolCfg.ConnConfig.Password),
 	)
 }
 

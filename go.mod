@@ -54,3 +54,7 @@ require (
 )
 
 tool github.com/caerus-framework/caerus-framework/cmd/caerusvet
+
+replace github.com/caerus-framework/caerus-framework => ../caerus-framework
+replace github.com/caerus-framework/caerus-framework-logs => ../caerus-framework-logs
+replace github.com/caerus-framework/caerus-framework-configuration => ../caerus-framework-configuration
