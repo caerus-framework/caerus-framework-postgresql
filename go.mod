@@ -44,7 +44,7 @@ require (
 
 require (
 	github.com/caerus-framework/caerus-framework-configuration v0.0.8
-	github.com/caerus-framework/caerus-framework-observability v0.0.5
+	github.com/caerus-framework/caerus-framework-observability v0.0.6
 	github.com/jackc/pgerrcode v0.0.0-20250907135507-afb5586c32a6 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
@@ -54,9 +54,3 @@ require (
 )
 
 tool github.com/caerus-framework/caerus-framework/cmd/caerusvet
-
-replace github.com/caerus-framework/caerus-framework => ../caerus-framework
-
-replace github.com/caerus-framework/caerus-framework-logs => ../caerus-framework-logs
-
-replace github.com/caerus-framework/caerus-framework-configuration => ../caerus-framework-configuration
