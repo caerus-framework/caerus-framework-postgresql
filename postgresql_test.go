@@ -338,6 +338,29 @@ func TestDegradedModeAllowsFailedPing(t *testing.T) {
 	_ = p.Shutdown(context.Background())
 }
 
+func TestDegradedModeShutdownStopsReconnect(t *testing.T) {
+	p := New(
+		WithHost("127.0.0.1"),
+		WithPort(1),
+		WithPingTimeout(50*time.Millisecond),
+		WithDegradedMode(true),
+	)
+	fw := newFramework(t)
+	if err := p.Init(context.Background(), fw); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = p.Shutdown(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown blocked on reconnect loop")
+	}
+}
+
 func TestDegradedModeHealthWhenReady(t *testing.T) {
 	p := New(
 		WithHost("127.0.0.1"),
