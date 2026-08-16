@@ -300,6 +300,24 @@ func TestIntegrationPoolMetrics(t *testing.T) {
 	if byName("postgresql_pool_idle") == nil || byName("postgresql_pool_total") == nil {
 		t.Fatal("idle/total gauges missing")
 	}
+	if byName("postgresql_pool_constructing") == nil {
+		t.Fatal("constructing gauge missing")
+	}
+	for _, name := range []string{
+		"postgresql_pool_acquire_duration_seconds",
+		"postgresql_pool_empty_acquire_wait_seconds",
+		"postgresql_pool_new_conns_total",
+		"postgresql_pool_max_lifetime_destroy_total",
+		"postgresql_pool_max_idle_destroy_total",
+	} {
+		m := byName(name)
+		if m == nil {
+			t.Fatalf("%s missing", name)
+		}
+		if m.Type != cf_observability.MetricTypeCounter {
+			t.Fatalf("%s Type = %v, want counter", name, m.Type)
+		}
+	}
 }
 
 // TestIntegrationWithinTx verifies commit and rollback behavior of the helper.

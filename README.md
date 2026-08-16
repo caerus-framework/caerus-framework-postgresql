@@ -80,8 +80,26 @@ func (a *App) note(ctx context.Context, id int) (string, error) {
 }
 ```
 
-Wrong: `store.New(pg.Pool())` at Init (dead after reload).
-Right: store `*CFPostgres`; `Pool()` per query.
+A store or sqlc helper is the same idea: hold `*CFPostgres`, never a
+`*pgxpool.Pool` from Init.
+
+```go
+type Store struct {
+	pg *cf_postgres.CFPostgres
+}
+
+func New(pg *cf_postgres.CFPostgres) *Store { return &Store{pg: pg} }
+
+func (s *Store) queries() *db.Queries {
+	return db.New(s.pg.Pool()) // sqlc New per call — cheap; pool is live
+}
+```
+
+```text
+Wrong: store.New(pg.Pool()) at Init, or q := db.New(pg.Pool()) kept on the
+       struct. After reload/reconnect the component closes that pool.
+Right: store.New(pg) with *CFPostgres; Pool() / db.New(pg.Pool()) per query.
+```
 
 ### Simple `main`-level wiring
 
@@ -102,14 +120,15 @@ unless `health_when_degraded` is `ready`.
 
 ## Usage
 
-After `fw.Run` (or in any component whose stage runs after `data`), get the
-pool and issue queries through the pgx API:
+After `fw.Run` (or in any component whose stage runs after `data`), call
+`Pool()` **on the component** for each query. Do not keep the `*pgxpool.Pool`
+value from Init.
 
 ```go
-pool := cf.MustGet[*cf_postgres.CFPostgres](fw).Pool()
+pg := cf.MustGet[*cf_postgres.CFPostgres](fw)
 
 var note string
-err := pool.QueryRow(ctx, "SELECT note FROM notes WHERE id = $1", 42).Scan(&note)
+err := pg.Pool().QueryRow(ctx, "SELECT note FROM notes WHERE id = $1", 42).Scan(&note)
 ```
 
 The pool provides connection reuse, health-checked idle connections, and safe
@@ -219,29 +238,98 @@ pool acquire tracing are secondary and not exposed — use
 
 ## Multiple instances
 
-Use `WithName` to run multiple postgres clients in the same process (e.g., primary and replica):
+A **read replica** is a second Postgres that **replays** the primary’s
+WAL. It is not a second schema you migrate, and it is not “Postgres but
+faster.” Use it when some queries can be **seconds behind** (exports,
+dashboards). Auth-style “I just saved, show me the row” stays on the
+**primary**.
+
+Caerus already decided how that looks in process: **two components**,
+`WithName`, two config files, `GetByName`, `Pool()` per use. Do **not**
+put `replica_dsn` on one `PostgresConfig` or make `Pool()` pick a
+server. Health, metrics, migrate jobs, and TLS reload are per
+`Name()`. A silent split is how on-call cannot tell which DSN died.
+
+`GetDependencies` lists those **component** names (what `Name()`
+returns), not a source nickname. When two instances exist,
+`cf.Get[*cf_postgres.CFPostgres]` is ambiguous and returns false — use
+`GetByName`.
 
 ```go
-primary := cf_postgres.New(
+pri := cf_postgres.New(
     cf_postgres.WithName("primary"),
-    cf_postgres.WithHost("primary.db.example.com"),
-    cf_postgres.WithDatabase("mydb"),
+    cf_postgres.WithConfigSource("postgresql", "config/postgresql.json"),
 )
-replica := cf_postgres.New(
+rep := cf_postgres.New(
     cf_postgres.WithName("replica"),
-    cf_postgres.WithHost("replica.db.example.com"),
-    cf_postgres.WithDatabase("mydb"),
+    cf_postgres.WithConfigSource("postgresql-replica", "config/postgresql-replica.json"),
 )
+fw.AddComponent(pri)
+fw.AddComponent(rep)
 
-fw.AddComponent(primary)
-fw.AddComponent(replica)
-
-// Retrieve by name
-primaryPool := cf.MustGetByName[*cf_postgres.CFPostgres](fw, "primary").Pool()
-replicaPool := cf.MustGetByName[*cf_postgres.CFPostgres](fw, "replica").Pool()
+primary := cf.MustGetByName[*cf_postgres.CFPostgres](fw, "primary")
+replica := cf.MustGetByName[*cf_postgres.CFPostgres](fw, "replica")
+err := replica.Pool().QueryRow(ctx, "SELECT 1").Scan(&n)
 ```
 
-When multiple instances exist, `cf.Get[*cf_postgres.CFPostgres](fw)` returns `false` to prevent ambiguous lookups. Always use `GetByName` for named instances.
+Writes, transactions, and read-your-writes: `primary.Pool()`. Stale-OK
+reads: `replica.Pool()`. Only **primary** runs
+`--postgresql.job=migrate` (or `--postgresql.primary.job=migrate` when
+`WithName("primary")`). The replica is a streaming copy.
+
+```mermaid
+flowchart LR
+  W[Writes and tx] --> P[primary Pool]
+  R[Stale-OK reads] --> S[replica Pool]
+  P --> DB[(Primary)]
+  S --> RP[(Streaming replica)]
+  DB -->|WAL| RP
+```
+
+### Readiness: two process shapes
+
+`/readyz` is red if **any** `HealthProvider` fails. A replica in the
+**API** process that cannot ping takes **checkout** out of the Service
+even when primary is fine.
+
+**Path A — Replica in the API pod** (optional reads on the user request):
+replica `degraded_mode` + `health_when_degraded: ready` so a dead
+replica does not drain traffic; metrics must scream; checkout must not
+require the replica.
+
+**Path B — Replica only on reporting/worker pods** (usual when those
+reads are not checkout): API registers **primary only**. Reporting pods
+register the replica. Each process’s `/readyz` matches that process’s
+job.
+
+### Mix-ups that show up in postmortems
+
+These are identity mistakes, not “Postgres is slow.”
+
+1. **Magic `Pool()`** — one component, two DSNs, driver or wrapper
+   routes SELECTs. Logs and `/readyz` name a single `postgresql`. You
+   cannot tell which host failed.
+2. **Read-your-writes on the replica** — user saves, next GET hits the
+   replica before WAL apply. Looks like data loss. CI often has zero
+   lag, so tests stay green. Keep “I just wrote this” on primary.
+3. **`/readyz` AND’s the replica** — replica blip pages as “the app is
+   down.” Use Path A (degraded-ready replica) or Path B (replica not in
+   the API graph).
+4. **Writes or migrate on the replica** — `cannot execute … in a
+   read-only transaction`, or `--postgresql.replica.job=migrate` treating
+   the standby as a second schema. Migrate **primary** only. sqlc writes
+   use `primary.Pool()`.
+5. **DSN / endpoint swap** — copy-paste leaves both files on the writer,
+   or after failover the “reader” CNAME is now the writer. The component
+   is still named `replica` but it is the primary (or both names hit one
+   host). Check `host` on `postgresql_info` / connect logs per
+   `component` label; do not trust the filename alone.
+
+Wrong: `replica_dsn` on one struct; `store.New(pg.Pool())` snapshot;
+checkout `GetDependencies` includes replica with default not-ready
+Health.  
+Right: two named `*CFPostgres`; `Pool()` per use; readyz matches the
+Deployment’s job.
 
 ## Migrations
 
@@ -490,13 +578,27 @@ labeled `database`, `user`, `host`, `port`, `component` = `Name()`):
 | `postgresql_pool_total` | gauge | total connections |
 | `postgresql_pool_max` | gauge | pool maximum |
 | `postgresql_pool_acquired` | gauge | currently acquired |
+| `postgresql_pool_constructing` | gauge | dials still in flight |
 | `postgresql_pool_acquire_total` | counter | cumulative successful acquires |
 | `postgresql_pool_empty_acquire_total` | counter | acquires that had to wait |
 | `postgresql_pool_canceled_acquire_total` | counter | acquires canceled by context |
+| `postgresql_pool_acquire_duration_seconds` | counter | cumulative time in successful acquires |
+| `postgresql_pool_empty_acquire_wait_seconds` | counter | cumulative wait while the pool was empty |
+| `postgresql_pool_new_conns_total` | counter | new connections opened |
+| `postgresql_pool_max_lifetime_destroy_total` | counter | closed for MaxConnLifetime |
+| `postgresql_pool_max_idle_destroy_total` | counter | closed for MaxConnIdleTime |
 
-Scrape `postgresql_pool_acquired / max` for **pool saturation** — the
-day-2 signal this module is for. Before `Init` or after `Shutdown` it reports
-nothing (lazy pickup).
+Scrape `postgresql_pool_acquired / max` for **pool saturation**. When
+saturation looks fine but latency is not, use wait time:
+
+`rate(postgresql_pool_empty_acquire_wait_seconds[5m])` and
+`rate(postgresql_pool_empty_acquire_wait_seconds[5m]) / rate(postgresql_pool_empty_acquire_total[5m])`
+(mean wait when the pool was empty). Churn:
+`rate(postgresql_pool_new_conns_total[5m])` vs
+`rate(postgresql_pool_max_lifetime_destroy_total[5m])` /
+`rate(postgresql_pool_max_idle_destroy_total[5m])`. Counters reset when the pool is rebuilt
+(reload / reconnect). Before `Init` or after `Shutdown` it reports nothing
+(lazy pickup).
 
 ## Tests
 

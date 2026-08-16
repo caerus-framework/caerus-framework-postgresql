@@ -1177,6 +1177,7 @@ func (c *CFPostgres) Metrics() []cf_observability.Metric {
 		{"postgresql_pool_total", "PostgreSQL pool total connections.", float64(st.TotalConns())},
 		{"postgresql_pool_max", "PostgreSQL pool maximum connections.", float64(st.MaxConns())},
 		{"postgresql_pool_acquired", "PostgreSQL pool currently acquired connections.", float64(st.AcquiredConns())},
+		{"postgresql_pool_constructing", "PostgreSQL pool connections still being dialed.", float64(st.ConstructingConns())},
 	}
 	for _, g := range gauges {
 		ms = append(ms, cf_observability.Metric{Name: g.name, Help: g.help, Value: g.value, Labels: copyLabels(labels)})
@@ -1189,6 +1190,11 @@ func (c *CFPostgres) Metrics() []cf_observability.Metric {
 		{"postgresql_pool_acquire_total", "Cumulative successful acquires from the PostgreSQL pool.", float64(st.AcquireCount())},
 		{"postgresql_pool_empty_acquire_total", "Cumulative acquires that had to wait for a free connection.", float64(st.EmptyAcquireCount())},
 		{"postgresql_pool_canceled_acquire_total", "Cumulative acquires canceled by context.", float64(st.CanceledAcquireCount())},
+		{"postgresql_pool_acquire_duration_seconds", "Cumulative time spent in successful pool acquires (seconds).", st.AcquireDuration().Seconds()},
+		{"postgresql_pool_empty_acquire_wait_seconds", "Cumulative time spent waiting because the pool was empty (seconds).", st.EmptyAcquireWaitTime().Seconds()},
+		{"postgresql_pool_new_conns_total", "Cumulative new connections opened by the pool.", float64(st.NewConnsCount())},
+		{"postgresql_pool_max_lifetime_destroy_total", "Connections closed because they exceeded MaxConnLifetime.", float64(st.MaxLifetimeDestroyCount())},
+		{"postgresql_pool_max_idle_destroy_total", "Connections closed because they exceeded MaxConnIdleTime.", float64(st.MaxIdleDestroyCount())},
 	}
 	for _, ct := range counters {
 		ms = append(ms, cf_observability.Metric{Name: ct.name, Help: ct.help, Value: ct.value, Labels: copyLabels(labels), Type: cf_observability.MetricTypeCounter})
