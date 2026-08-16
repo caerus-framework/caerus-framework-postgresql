@@ -36,52 +36,69 @@ For every new service using this component:
 
 ## Wiring
 
+Two wiring shapes. Prefer the **app-owned** shape.
+
+### App-owned consumer (golden — demoapp pattern)
+
+`main` declares postgres as chassis. The app holds `*CFPostgres` and calls
+`Pool()` **per use** (never copy the pool at Init — reload/reconnect swap
+it).
+
 ```go
-package main
+fw := cf.New(&cf.FrameworkOptions{
+	Logs:          &cf.LogsSettings{Format: "json", Level: "info", ConfigSource: "logs"},
+	Observability: &cf.ObservabilitySettings{Address: ":9090", ConfigSource: "observability"},
+	Components: []cf.CaerusComponent{
+		cf_postgres.New(cf_postgres.WithConfigSource("postgresql", "config/postgresql.json")),
+		app.New(),
+	},
+})
+```
 
-import (
-	"context"
-	"log/slog"
-	"os"
+```go
+type App struct {
+	pg *cf_postgres.CFPostgres
+}
 
-	cf "github.com/caerus-framework/caerus-framework"
-	cf_logs "github.com/caerus-framework/caerus-framework-logs"
-	cf_postgres "github.com/caerus-framework/caerus-framework-postgresql"
-)
+func (a *App) GetDependencies() []string {
+	return []string{cf_postgres.ComponentName}
+}
 
-func main() {
-	fw := cf.New()
-
-	logs := cf_logs.New(cf_logs.WithWriter(os.Stdout))
-	if err := fw.AddComponent(logs); err != nil { // "logs" is a required dependency
-		slog.Error("register logs", "err", err)
-		os.Exit(1)
+func (a *App) Init(ctx context.Context, fw *cf.CaerusFramework) error {
+	pg, ok := cf.Get[*cf_postgres.CFPostgres](fw)
+	if !ok {
+		return errors.New("app: postgresql missing")
 	}
+	a.pg = pg
+	return nil
+}
 
-	postgres := cf_postgres.New(
-		cf_postgres.WithHost("127.0.0.1"),
-		cf_postgres.WithPort(5432),
-		cf_postgres.WithUser("svc"),
-		cf_postgres.WithPassword("secret"),
-		cf_postgres.WithDatabase("mydb"),
-		cf_postgres.WithSSLMode("disable"),
-	)
-	app := NewMyApp(postgres) // any component with GetDependencies() -> []string{cf_postgres.ComponentName}
-	if err := fw.AddComponent(postgres); err != nil {
-		slog.Error("register postgres", "err", err)
-		os.Exit(1)
-	}
-	if err := fw.AddComponent(app); err != nil {
-		slog.Error("register app", "err", err)
-		os.Exit(1)
-	}
-
-	if err := fw.Run(context.Background()); err != nil {
-		slog.Error("startup failed", "err", err)
-		os.Exit(1)
-	}
+func (a *App) note(ctx context.Context, id int) (string, error) {
+	var note string
+	err := a.pg.Pool().QueryRow(ctx, "SELECT note FROM notes WHERE id = $1", id).Scan(&note)
+	return note, err
 }
 ```
+
+Wrong: `store.New(pg.Pool())` at Init (dead after reload).
+Right: store `*CFPostgres`; `Pool()` per query.
+
+### Simple `main`-level wiring
+
+```go
+fw := cf.New()
+fw.AddComponent(cf_logs.New(cf_logs.WithWriter(os.Stdout)))
+fw.AddComponent(cf_postgres.New(
+	cf_postgres.WithHost("127.0.0.1"),
+	cf_postgres.WithDatabase("mydb"),
+))
+```
+
+Then `cf.MustGet[*cf_postgres.CFPostgres](fw)`. Still `Pool()` per use.
+
+With `degraded_mode`, Init can succeed while Postgres is down. A background
+loop retries ping/rebuild until the server is up. `Health` stays not-ready
+unless `health_when_degraded` is `ready`.
 
 ## Usage
 

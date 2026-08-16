@@ -493,6 +493,8 @@ type CFPostgres struct {
 	// degradedUnreachable: Init ping failed under DegradedMode (or later ping lost).
 	degradedUnreachable atomic.Bool
 	degradedModeUses    atomic.Uint64
+	reconnectCancel     context.CancelFunc
+	reconnectWG         sync.WaitGroup
 }
 
 // New creates a postgresql component. The pool is created and pinged at Init,
@@ -762,6 +764,7 @@ func (c *CFPostgres) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 			"port", poolCfg.ConnConfig.Port,
 			"health_when_degraded", c.healthWhenDegraded,
 		)
+		c.startReconnectLocked()
 		return nil
 	}
 
@@ -784,6 +787,7 @@ func (c *CFPostgres) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 			"port", poolCfg.ConnConfig.Port,
 			"health_when_degraded", c.healthWhenDegraded,
 		)
+		c.startReconnectLocked()
 		return nil
 	}
 
@@ -815,6 +819,9 @@ func (c *CFPostgres) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 		"max_conns", poolCfg.MaxConns,
 		cf_logs.SecretSet("password", poolCfg.ConnConfig.Password),
 	)
+	if c.degradedMode {
+		c.startReconnectLocked()
+	}
 	return nil
 }
 
@@ -1009,6 +1016,15 @@ func (c *CFPostgres) applyMigrations(pool *pgxpool.Pool, m *migrationConfig) err
 // Shutdown implements cf.CaerusComponent. It closes the pgx pool; further use
 // of Pool() after shutdown returns nil.
 func (c *CFPostgres) Shutdown(ctx context.Context) error {
+	c.mu.Lock()
+	stop := c.reconnectCancel
+	c.reconnectCancel = nil
+	c.mu.Unlock()
+	if stop != nil {
+		stop()
+		c.reconnectWG.Wait()
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.logsSub != nil {
