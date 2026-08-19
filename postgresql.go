@@ -881,13 +881,13 @@ func (c *CFPostgres) poolConfigFromSource() (*pgxpool.Config, bool, string, erro
 		return nil, false, "", fmt.Errorf("cf_postgres: configuration source %q not found", c.configSource)
 	}
 	cfg := c.baseConfig.Copy()
-	if err := applyLoadedConfig(cfg, *loaded); err != nil {
+	if err := applyLoadedConfig(cfg, loaded); err != nil {
 		return nil, false, "", err
 	}
 	if err := applyTLSFiles(cfg.ConnConfig, c.tlsFiles); err != nil {
 		return nil, false, "", err
 	}
-	degrade, healthDegraded := degradedModeFromConfig(*loaded, c.degradedMode, c.healthWhenDegraded)
+	degrade, healthDegraded := degradedModeFromConfig(loaded, c.degradedMode, c.healthWhenDegraded)
 	return cfg, degrade, healthDegraded, nil
 }
 
