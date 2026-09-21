@@ -1,6 +1,7 @@
 package cf_postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -310,6 +311,49 @@ func TestInitRejectsUnknownServer(t *testing.T) {
 	}
 	if pool := p.Pool(); pool != nil {
 		t.Fatal("Pool() should be nil after failed Init")
+	}
+}
+
+func TestInitLogsNeverContainFixturePassword(t *testing.T) {
+	const fixture = "fixture-pw-should-never-appear"
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	p := New(
+		WithHost("127.0.0.1"),
+		WithPort(1),
+		WithUser("alice"),
+		WithPassword(fixture),
+		WithPingTimeout(200*time.Millisecond),
+		WithDegradedMode(true),
+		WithLogger(log),
+	)
+	fw := newFramework(t)
+	if err := p.Init(context.Background(), fw); err != nil {
+		t.Fatalf("DegradedMode Init: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+	out := buf.String()
+	if strings.Contains(out, fixture) {
+		t.Fatalf("Init logs contained fixture password:\n%s", out)
+	}
+
+	buf.Reset()
+	hard := New(
+		WithHost("127.0.0.1"),
+		WithPort(1),
+		WithPassword(fixture),
+		WithPingTimeout(200*time.Millisecond),
+		WithLogger(log),
+	)
+	err := hard.Init(context.Background(), newFramework(t))
+	if err == nil {
+		t.Fatal("hard Init against a closed port should fail")
+	}
+	if strings.Contains(buf.String(), fixture) {
+		t.Fatalf("failed Init logs contained fixture password:\n%s", buf.String())
+	}
+	if strings.Contains(err.Error(), fixture) {
+		t.Fatalf("Init error contained fixture password: %v", err)
 	}
 }
 

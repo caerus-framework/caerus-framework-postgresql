@@ -53,11 +53,16 @@ const defaultConnString = "postgres://127.0.0.1:5432"
 // pass it via WithConfig; both JSON and YAML tags are provided. Durations are
 // in seconds.
 type PostgresConfig struct {
-	Host                 string `json:"host,omitempty" yaml:"host,omitempty" env:"HOST"`
-	Port                 int    `json:"port,omitempty" yaml:"port,omitempty" env:"PORT"`
-	User                 string `json:"user,omitempty" yaml:"user,omitempty" env:"USER"`
-	Password             string `json:"password,omitempty" yaml:"password,omitempty" env:"PASSWORD" secret:"redact"`
-	Database             string `json:"database,omitempty" yaml:"database,omitempty" env:"DATABASE"`
+	Host     string `json:"host,omitempty" yaml:"host,omitempty" env:"HOST"`
+	Port     int    `json:"port,omitempty" yaml:"port,omitempty" env:"PORT"`
+	User     string `json:"user,omitempty" yaml:"user,omitempty" env:"USER"`
+	Password string `json:"password,omitempty" yaml:"password,omitempty" env:"PASSWORD" secret:"redact"`
+	Database string `json:"database,omitempty" yaml:"database,omitempty" env:"DATABASE"`
+	// SSLMode is the libpq sslmode. Empty in the file leaves the DSN / pgx
+	// default (prefer on the built-in connection string). Empty is not a
+	// production default — product charts should set require or verify-full.
+	// See the README TLS section (Path A cluster, Path B laptop, override
+	// when the server has no TLS).
 	SSLMode              string `json:"ssl_mode,omitempty" yaml:"ssl_mode,omitempty" env:"SSL_MODE"`
 	MaxConns             int32  `json:"max_conns,omitempty" yaml:"max_conns,omitempty" env:"MAX_CONNS"`
 	MinConns             int32  `json:"min_conns,omitempty" yaml:"min_conns,omitempty" env:"MIN_CONNS"`
@@ -183,6 +188,8 @@ func WithEmbeddedMigrations(fsys embed.FS, dir string, opts ...MigrationOption) 
 // ping (fail-fast). Use for local/single-replica only. Production should keep
 // WithMigrations (so the framework job flag works) but omit WithMigrateOnInit on
 // the serving Deployment, and run the Job with --postgresql.job=migrate instead.
+// Do not combine with [WithDegradedMode]: migrate needs a live pool; a degraded
+// Init that skipped ping never reaches Migrate.
 func WithMigrateOnInit() Option {
 	return func(o *options) { o.migrateOnInit = true }
 }
@@ -307,12 +314,15 @@ func WithDatabase(db string) Option {
 }
 
 // WithSSLMode sets the sslmode (disable, prefer, require, verify-ca,
-// verify-full). The default from the base connection string is "prefer".
-// The TLS config and fallback chain are re-derived from the current
-// host/port, so sslmode="prefer" still attempts plaintext as a fallback on
-// the same address. An unknown mode is recorded and returned from Init
-// (New does not panic): silently ignoring an explicit TLS requirement would
-// be worse than failing startup.
+// verify-full). The default from the base connection string is "prefer"
+// (try TLS, then plaintext fallback). That is a laptop default, not a
+// Kubernetes default — product charts should set require or verify-full
+// (README TLS Path A). require encrypts but skips hostname/CA verify
+// (libpq); verify-full is the verify path. prefer still attempts
+// plaintext as a fallback on the same address. An unknown mode is
+// recorded and returned from Init (New does not panic): silently
+// ignoring an explicit TLS requirement would be worse than failing
+// startup.
 func WithSSLMode(mode string) Option {
 	return func(o *options) {
 		if err := applySSLMode(o.poolConfig.ConnConfig, mode); err != nil && o.optErr == nil {
@@ -452,7 +462,9 @@ func WithName(name string) Option {
 
 // WithDegradedMode allows Init to succeed when the connectivity ping (or pool
 // create) fails. Default is hard-fail. Degraded mode screams in logs/metrics;
-// Health still fails ping unless HealthWhenDegraded is "ready".
+// Health still fails ping unless HealthWhenDegraded is "ready". Do not combine
+// with [WithMigrateOnInit]: migrate needs a live pool; a degraded Init that
+// skipped ping never applies schema.
 func WithDegradedMode(enabled bool) Option {
 	return func(o *options) { o.degradedMode = enabled }
 }
