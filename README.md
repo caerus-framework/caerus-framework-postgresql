@@ -165,7 +165,7 @@ For more control (`pgx.TxOptions`, savepoints) use `pool.Begin(ctx)` and
 | `WithUser(u)` | role to connect as (default: current OS user) |
 | `WithPassword(p)` | authentication password |
 | `WithDatabase(d)` | database name (default: the user name) |
-| `WithSSLMode(m)` | `disable`, `prefer`, `require`, `verify-ca`, `verify-full` (default `prefer`); unknown mode fails at `Init` |
+| `WithSSLMode(m)` | `disable` / `prefer` / `require` / `verify-ca` / `verify-full`. Code default is `prefer` (laptop, plaintext fallback). Charts should set Path A (`require` or `verify-full`). Unknown mode fails at `Init`. See [TLS (`ssl_mode`)](#tls-ssl_mode). |
 | `WithApplicationName(n)` | sets the `application_name` runtime parameter |
 | `WithStatementTimeout(d)` | per-connection `statement_timeout` runtime parameter (ms); 0 = unset |
 | `WithLockTimeout(d)` | per-connection `lock_timeout` runtime parameter (ms); 0 = unset |
@@ -178,15 +178,107 @@ For more control (`pgx.TxOptions`, savepoints) use `pool.Begin(ctx)` and
 | `WithHealthCheckPeriod(d)` | idle health-check interval (default `1m`) |
 | `WithConnectTimeout(d)` | per-attempt connect timeout (default `0` = none, libpq default) |
 | `WithPingTimeout(d)` | Init connectivity-ping timeout (default `5s`) |
-| `WithDegradedMode(bool)` | when true, Init may succeed without a live ping/pool (default **off** / hard-fail) |
+| `WithDegradedMode(bool)` | when true, Init may succeed without a live ping/pool (default **off** / hard-fail). Serve/break-glass only — not with `WithMigrateOnInit`. |
 | `WithHealthWhenDegraded("not_ready"\|"ready")` | `/readyz` while degraded: default `not_ready`; `ready` is break-glass LB traffic |
 | `WithMigrations(fsys, opts...)` | configure a migration FS (already rooted at the `.up.sql`/`.down.sql` dir) for `Migrate` / the framework job flag |
 | `WithEmbeddedMigrations(fsys, dir, opts...)` | like `WithMigrations` but takes the `//go:embed` FS + directory and resolves the sub-FS internally (mismatched dir panics at construction) |
-| `WithMigrateOnInit()` | `Init` calls `Migrate` (local/single-replica only) |
+| `WithMigrateOnInit()` | `Init` calls `Migrate` (local/single-replica only). Do not combine with `WithDegradedMode`. |
 | `WithMigrationsTable(name)` | migrations tracking table (default `schema_migrations`) |
 | `WithName(name)` | custom component name for multiple instances (default `"postgresql"`) |
 | `WithQueryTracer(pgx.QueryTracer)` | pgx query tracer around every Query/QueryRow/Exec; survives pool rebuilds on config reload |
 | `WithLogger(*slog.Logger)` | explicit logger override; defaults to the framework `logs` component's logger (re-delivered on `logs` `Reconfigure`), falling back to `slog.Default()` |
+
+## TLS (`ssl_mode`)
+
+This module matches **libpq**. It does **not** flip Kubernetes to TLS just
+because the process is in a cluster. An omitted `ssl_mode` in the file
+leaves the DSN / pgx default (`prefer` on the built-in connection
+string). **Empty is not a production default.** Copying a laptop file
+that omits `ssl_mode` into a serve chart ships a plaintext fallback on
+the pod network.
+
+```mermaid
+flowchart TD
+  q{Can the Postgres server present TLS?}
+  q -->|yes, and you have a CA| a["Path A: verify-full + tls_root_ca_file"]
+  q -->|yes, encryption only for now| r["Path A minimum: require"]
+  q -->|no, laptop loopback| b["Path B: disable"]
+  q -->|no, server has no TLS at all| o["Override: disable, explicit in the chart"]
+```
+
+### What each `ssl_mode` means
+
+| Mode | One sentence | Where it belongs |
+|---|---|---|
+| `disable` | No TLS. Password and queries are plaintext on the network. | Path B (laptop loopback) or the TLS-unavailable override. |
+| `prefer` | Try TLS, then **fall back to plaintext** on the same host. | Laptop only. Not a cluster setting. |
+| `require` | Encrypt, but **do not** verify the server name or CA (`InsecureSkipVerify`, same as libpq). | Path A **minimum** when you cannot pin a CA yet. Not “safe TLS.” |
+| `verify-ca` | Encrypt and check the server cert against a CA; hostname is not checked. | When you have a CA file but not hostname matching. |
+| `verify-full` | Encrypt and verify CA **and** hostname. | Path A recommended when the CA is private (`tls_root_ca_file`). |
+
+There is no separate Valkey-style `tls_insecure_skip_verify` switch.
+Postgres uses this `sslmode` vocabulary. `require` **is** the skip-verify
+mode.
+
+### Path A — Cluster TLS (recommended for Kubernetes)
+
+Product charts **set** `ssl_mode`. Prefer `verify-full` plus a mounted CA
+when the CA is private. If you only need encryption today and cannot pin
+a CA yet, `require` is the minimum Path A setting.
+
+```json
+{
+  "host": "postgres.db.svc",
+  "ssl_mode": "verify-full",
+  "tls_root_ca_file": "/var/run/secrets/pg-ca/ca.pem"
+}
+```
+
+Minimum Path A (encrypt, no hostname/CA verify):
+
+```json
+{ "ssl_mode": "require" }
+```
+
+```text
+Wrong: omit ssl_mode in the serve chart and assume Kubernetes is TLS.
+Right: set require or verify-full (+ CA file) in the chart.
+
+Wrong: read “require” as “the certificate is trusted.”
+Right: require encrypts only. verify-full (+ tls_root_ca_file) verifies.
+```
+
+### Path B — Laptop / Compose on loopback
+
+```json
+{ "host": "127.0.0.1", "ssl_mode": "disable" }
+```
+
+Use only when the process and Postgres share loopback. Do **not** paste
+this file into a cluster chart because “it worked locally.”
+
+### Override — TLS unavailable on the Postgres server
+
+Some environments still run Postgres with TLS turned off (a vendor that
+never enabled it, a lab cluster, old on-prem). This module will not
+invent a process-global “always TLS” switch that makes those setups
+unstartable.
+
+Set `ssl_mode: disable` **explicitly** in that chart or file so Git
+shows the choice — do not leave the key omitted and inherit `prefer`.
+Passwords then travel in cleartext on the pod network; NetworkPolicy /
+a private CNI is the remaining protection. Move to Path A as soon as
+the server can present a certificate.
+
+This override is **not** Path B. Path B is laptop loopback. The override
+is a tracked cluster exception because the **server** has no TLS.
+
+```text
+Wrong: ssl_mode: prefer on a serve pod so “we use TLS if the server has it.”
+Right: prefer still falls back to plaintext. That is a laptop setting.
+       Cluster: Path A, or this named override if the server has no TLS.
+```
+
 
 ## Query tracing
 
@@ -516,7 +608,8 @@ Helpers: `ParseDSN` / `OverlayDSN` for `postgres://` URLs and keyword DSNs.
 `ParseDSN` errors never include the raw DSN (pgx would interpolate the
 password). `Password` is tagged `secret:"redact"`: `LogArgs` prints
 `[redacted]`, connect/reload logs use `password_set` only. Do not log the
-config struct.
+config struct. Set `ssl_mode` in the file (see [TLS (`ssl_mode`)](#tls-ssl_mode));
+an omitted key is not a Kubernetes TLS default.
 `WithConfigSource` implements `ConfigReloader`: on file reload (or
 `cfg.Reload`), builds a new pool, pings, swaps, closes the old pool; on failure
 keeps the previous pool. In Kubernetes prefer file-mounted secrets for
@@ -533,9 +626,19 @@ returns an error and startup aborts before any dependent component runs.
 
 **Not automatic.** Default remains hard Init. Set `degraded_mode: true` (or
 `WithDegradedMode(true)`) when the process must finish Initialize even if
-Postgres is unreachable. Migrate-on-Init and migrate Jobs still need a live
-pool — DegradedMode is for serve/break-glass shapes, not for skipping schema
-work.
+Postgres is unreachable. Migrate Jobs still need a live pool — DegradedMode
+is for serve/break-glass shapes, not for skipping schema work.
+
+Do **not** combine DegradedMode Init with `WithMigrateOnInit`. Migrate
+needs a live pool. If ping fails under DegradedMode, `Init` returns
+success **before** it would have called `Migrate`, so the process can
+serve (or sit not-ready) with schema that was never applied.
+
+```text
+Wrong: WithDegradedMode(true) and WithMigrateOnInit() on the same process.
+Right: migrate Job (or local WithMigrateOnInit only) against a live pool;
+       DegradedMode on a serving process that may start without Postgres.
+```
 
 ```json
 {
